@@ -16,6 +16,11 @@ import optuna
 import torch
 import torch.nn.functional as F
 import transformers
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.animation import FuncAnimation, PillowWriter
+import os
 from accelerate.utils import (
     is_mlu_available,
     is_musa_available,
@@ -127,6 +132,485 @@ def obtain_merge_strategy(settings: Settings) -> str | None:
     else:
         return "merge"
 
+def plot_layer_residuals_pca_comparison(layer_index, base_residuals_good, base_residuals_bad, 
+                                       trial_residuals_good, trial_residuals_bad,
+                                       save_dir=None, plot_type='both', show_plot=True):
+    """Generate comparison PCA plot (2D, 3D, or both) showing base and trial residuals for a single layer."""
+    # Combine base and trial residuals
+    combined = torch.cat((base_residuals_good, base_residuals_bad, trial_residuals_good, trial_residuals_bad), dim=0)
+    # Perform PCA
+    pca = PCA(n_components=3, random_state=42)
+    combined_3d = pca.fit_transform(combined.cpu().numpy())
+    
+    # Split into base_good, base_bad, trial_good, trial_bad
+    base_good_3d = combined_3d[:base_residuals_good.shape[0]]
+    base_bad_3d = combined_3d[base_residuals_good.shape[0]:base_residuals_good.shape[0] + base_residuals_bad.shape[0]]
+    trial_good_3d = combined_3d[base_residuals_good.shape[0] + base_residuals_bad.shape[0]:base_residuals_good.shape[0] + base_residuals_bad.shape[0] + trial_residuals_good.shape[0]]
+    trial_bad_3d = combined_3d[base_residuals_good.shape[0] + base_residuals_bad.shape[0] + trial_residuals_good.shape[0]:]
+    
+    explained_variance = pca.explained_variance_ratio_
+    
+    # Create directory if saving
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    
+    # Create 2D plot if requested
+    if plot_type in ['2d', 'both']:
+        fig_2d = plt.figure(figsize=(12, 9))
+        ax_2d = fig_2d.add_subplot(111)
+        ax_2d.scatter(base_good_3d[:, 0], base_good_3d[:, 1], c='royalblue', label='Base Good', alpha=0.7, s=20)
+        ax_2d.scatter(base_bad_3d[:, 0], base_bad_3d[:, 1], c='darkorange', label='Base Bad', alpha=0.7, s=20)
+        ax_2d.scatter(trial_good_3d[:, 0], trial_good_3d[:, 1], c='green', label='Trial Good', alpha=0.7, s=20)
+        ax_2d.scatter(trial_bad_3d[:, 0], trial_bad_3d[:, 1], c='red', label='Trial Bad', alpha=0.7, s=20)
+        ax_2d.set_title(f'Layer {layer_index} - 2D PCA Comparison\n(Explained variance: PC1={explained_variance[0]:.2%}, PC2={explained_variance[1]:.2%})')
+        ax_2d.set_xlabel(f'PC1 ({explained_variance[0]:.2%})')
+        ax_2d.set_ylabel(f'PC2 ({explained_variance[1]:.2%})')
+        ax_2d.legend()
+        ax_2d.grid(True, alpha=0.3)
+        
+        if save_dir:
+            fig_2d.savefig(os.path.join(save_dir, 'pca_2d_comparison.png'), dpi=150, bbox_inches='tight')
+            plt.close(fig_2d)
+        elif show_plot:
+            plt.show()
+    
+    # Create 3D plot if requested
+    if plot_type in ['3d', 'both']:
+        fig_3d = plt.figure(figsize=(14, 11))
+        ax_3d = fig_3d.add_subplot(111, projection='3d')
+        ax_3d.scatter(base_good_3d[:, 0], base_good_3d[:, 1], base_good_3d[:, 2], 
+                     c='royalblue', label='Base Good', alpha=0.7, s=20)
+        ax_3d.scatter(base_bad_3d[:, 0], base_bad_3d[:, 1], base_bad_3d[:, 2], 
+                     c='darkorange', label='Base Bad', alpha=0.7, s=20)
+        ax_3d.scatter(trial_good_3d[:, 0], trial_good_3d[:, 1], trial_good_3d[:, 2], 
+                     c='green', label='Trial Good', alpha=0.7, s=20)
+        ax_3d.scatter(trial_bad_3d[:, 0], trial_bad_3d[:, 1], trial_bad_3d[:, 2], 
+                     c='red', label='Trial Bad', alpha=0.7, s=20)
+        ax_3d.set_title(f'Layer {layer_index} - 3D PCA Comparison\n(Total explained variance: {sum(explained_variance):.2%})')
+        ax_3d.set_xlabel(f'PC1 ({explained_variance[0]:.2%})')
+        ax_3d.set_ylabel(f'PC2 ({explained_variance[1]:.2%})')
+        ax_3d.set_zlabel(f'PC3 ({explained_variance[2]:.2%})')
+        ax_3d.legend()
+        ax_3d.view_init(elev=30, azim=45)
+        
+        if save_dir:
+            fig_3d.savefig(os.path.join(save_dir, 'pca_3d_comparison.png'), dpi=150, bbox_inches='tight')
+            plt.close(fig_3d)
+        elif show_plot:
+            plt.show()
+
+def save_pca_plots_comparison(base_residuals_good, base_residuals_bad, 
+                             trial_residuals_good, trial_residuals_bad,
+                             save_dir, 
+                             plot_type='both', 
+                             create_evolution_gifs=False, 
+                             gif_type='3d', 
+                             gif_duration_per_frame=500,
+                             fixed_gif_view=True, 
+                             prefix=""):
+    """Save comparison PCA plots for all layers with options for 2D/3D and evolution GIFs."""
+    
+    # Create main directory
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Save individual layer comparison plots
+    print("Saving individual layer comparison plots...")
+    for layer_idx in range(base_residuals_good.shape[1]):
+        # Create layer directory
+        layer_dir = os.path.join(save_dir, f"layer_{layer_idx}")
+        os.makedirs(layer_dir, exist_ok=True)
+        
+        # Save static comparison plots
+        plot_layer_residuals_pca_comparison(
+            layer_idx, 
+            base_residuals_good[:, layer_idx, :],
+            base_residuals_bad[:, layer_idx, :],
+            trial_residuals_good[:, layer_idx, :],
+            trial_residuals_bad[:, layer_idx, :],
+            layer_dir, 
+            plot_type=plot_type, 
+            show_plot=False
+        )
+    
+    # Create comparison evolution GIFs if requested
+    if create_evolution_gifs:
+        print("Creating layer comparison evolution GIFs...")
+        create_layer_evolution_gif_comparison(
+            base_residuals_good, base_residuals_bad,
+            trial_residuals_good, trial_residuals_bad,
+            save_dir,
+            gif_type=gif_type, 
+            duration_per_frame=gif_duration_per_frame,
+            fixed_view=fixed_gif_view,
+            prefix=prefix
+        )
+
+def create_layer_evolution_gif_comparison(base_residuals_good, base_residuals_bad,
+                                         trial_residuals_good, trial_residuals_bad,
+                                         save_dir, 
+                                         gif_type='3d', 
+                                         duration_per_frame=500, 
+                                         prefix="", 
+                                         fixed_view=True):
+    """Create GIF showing PCA evolution across layers for both base and trial residuals."""
+    
+    num_layers = base_residuals_good.shape[1]
+    
+    # Pre-compute PCA for all layers
+    layer_pca_data = []
+    max_vals = {'x': float('-inf'), 'y': float('-inf'), 'z': float('-inf')}
+    min_vals = {'x': float('inf'), 'y': float('inf'), 'z': float('inf')}
+    
+    print("Pre-computing PCA for all layers (base and trial)...")
+    for layer_idx in range(num_layers):
+        base_good_layer = base_residuals_good[:, layer_idx, :]
+        base_bad_layer = base_residuals_bad[:, layer_idx, :]
+        trial_good_layer = trial_residuals_good[:, layer_idx, :]
+        trial_bad_layer = trial_residuals_bad[:, layer_idx, :]
+        
+        # Combine all residuals
+        combined = torch.cat((base_good_layer, base_bad_layer, trial_good_layer, trial_bad_layer), dim=0)
+        # Perform PCA
+        pca = PCA(n_components=3, random_state=42)
+        combined_3d = pca.fit_transform(combined.cpu().numpy())
+        
+        # Split back into four sets
+        base_good_3d = combined_3d[:base_good_layer.shape[0]]
+        base_bad_3d = combined_3d[base_good_layer.shape[0]:base_good_layer.shape[0] + base_bad_layer.shape[0]]
+        trial_good_3d = combined_3d[base_good_layer.shape[0] + base_bad_layer.shape[0]:base_good_layer.shape[0] + base_bad_layer.shape[0] + trial_good_layer.shape[0]]
+        trial_bad_3d = combined_3d[base_good_layer.shape[0] + base_bad_layer.shape[0] + trial_good_layer.shape[0]:]
+        
+        explained_variance = pca.explained_variance_ratio_
+        
+        layer_pca_data.append({
+            'base_good': base_good_3d,
+            'base_bad': base_bad_3d,
+            'trial_good': trial_good_3d,
+            'trial_bad': trial_bad_3d,
+            'explained_variance': explained_variance,
+            'layer_idx': layer_idx
+        })
+        
+        # Update min/max for consistent axes
+        for data in [base_good_3d, base_bad_3d, trial_good_3d, trial_bad_3d]:
+            max_vals['x'] = max(max_vals['x'], data[:, 0].max())
+            max_vals['y'] = max(max_vals['y'], data[:, 1].max())
+            max_vals['z'] = max(max_vals['z'], data[:, 2].max())
+            min_vals['x'] = min(min_vals['x'], data[:, 0].min())
+            min_vals['y'] = min(min_vals['y'], data[:, 1].min())
+            min_vals['z'] = min(min_vals['z'], data[:, 2].min())
+    
+    # Add some padding to the axes limits
+    for axis in ['x', 'y', 'z']:
+        padding = (max_vals[axis] - min_vals[axis]) * 0.1
+        max_vals[axis] += padding
+        min_vals[axis] -= padding
+    
+    if gif_type in ['3d', 'both']:
+        print("Creating 3D layer comparison evolution GIF...")
+        # Create 3D layer comparison evolution GIF
+        fig = plt.figure(figsize=(14, 11))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        def animate_3d(frame):
+            ax.clear()
+            layer_data = layer_pca_data[frame]
+            base_good_3d = layer_data['base_good']
+            base_bad_3d = layer_data['base_bad']
+            trial_good_3d = layer_data['trial_good']
+            trial_bad_3d = layer_data['trial_bad']
+            explained_variance = layer_data['explained_variance']
+            
+            ax.scatter(base_good_3d[:, 0], base_good_3d[:, 1], base_good_3d[:, 2], 
+                      c='royalblue', label='Base Good', alpha=0.7, s=20)
+            ax.scatter(base_bad_3d[:, 0], base_bad_3d[:, 1], base_bad_3d[:, 2], 
+                      c='darkorange', label='Base Bad', alpha=0.7, s=20)
+            ax.scatter(trial_good_3d[:, 0], trial_good_3d[:, 1], trial_good_3d[:, 2], 
+                      c='green', label='Trial Good', alpha=0.7, s=20)
+            ax.scatter(trial_bad_3d[:, 0], trial_bad_3d[:, 1], trial_bad_3d[:, 2], 
+                      c='red', label='Trial Bad', alpha=0.7, s=20)
+            
+            ax.set_title(f'Layer {frame} Comparison - 3D PCA\nTotal explained variance: {sum(explained_variance):.2%}')
+            ax.set_xlabel(f'PC1 ({explained_variance[0]:.2%})')
+            ax.set_ylabel(f'PC2 ({explained_variance[1]:.2%})')
+            ax.set_zlabel(f'PC3 ({explained_variance[2]:.2%})')
+            ax.legend()
+            
+            # Set consistent axes limits
+            ax.set_xlim(min_vals['x'], max_vals['x'])
+            ax.set_ylim(min_vals['y'], max_vals['y'])
+            ax.set_zlim(min_vals['z'], max_vals['z'])
+            
+            if fixed_view:
+                ax.view_init(elev=30, azim=45)
+            
+            return ax,
+        
+        anim_3d = FuncAnimation(fig, animate_3d, frames=num_layers, 
+                                interval=duration_per_frame, blit=False)
+        gif_path_3d = os.path.join(save_dir, f'{prefix}pca_3d_layer_comparison_evolution.gif')
+        anim_3d.save(gif_path_3d, writer=PillowWriter(fps=1000/duration_per_frame))
+        plt.close(fig)
+        print(f"Saved 3D layer comparison evolution GIF to {gif_path_3d}")
+    
+    if gif_type in ['2d', 'both']:
+        print("Creating 2D layer comparison evolution GIF...")
+        # Create 2D layer comparison evolution GIF
+        fig, ax = plt.subplots(figsize=(12, 9))
+        
+        def animate_2d(frame):
+            ax.clear()
+            layer_data = layer_pca_data[frame]
+            base_good_3d = layer_data['base_good']
+            base_bad_3d = layer_data['base_bad']
+            trial_good_3d = layer_data['trial_good']
+            trial_bad_3d = layer_data['trial_bad']
+            explained_variance = layer_data['explained_variance']
+            
+            ax.scatter(base_good_3d[:, 0], base_good_3d[:, 1], 
+                      c='royalblue', label='Base Good', alpha=0.7, s=20)
+            ax.scatter(base_bad_3d[:, 0], base_bad_3d[:, 1], 
+                      c='darkorange', label='Base Bad', alpha=0.7, s=20)
+            ax.scatter(trial_good_3d[:, 0], trial_good_3d[:, 1], 
+                      c='green', label='Trial Good', alpha=0.7, s=20)
+            ax.scatter(trial_bad_3d[:, 0], trial_bad_3d[:, 1], 
+                      c='red', label='Trial Bad', alpha=0.7, s=20)
+            
+            ax.set_title(f'Layer {frame} Comparison - 2D PCA\nPC1={explained_variance[0]:.2%}, PC2={explained_variance[1]:.2%}')
+            ax.set_xlabel(f'PC1 ({explained_variance[0]:.2%})')
+            ax.set_ylabel(f'PC2 ({explained_variance[1]:.2%})')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # Set consistent axes limits
+            ax.set_xlim(min_vals['x'], max_vals['x'])
+            ax.set_ylim(min_vals['y'], max_vals['y'])
+            
+            return ax,
+        
+        anim_2d = FuncAnimation(fig, animate_2d, frames=num_layers, 
+                                interval=duration_per_frame, blit=False)
+        gif_path_2d = os.path.join(save_dir, f'{prefix}pca_2d_layer_comparison_evolution.gif')
+        anim_2d.save(gif_path_2d, writer=PillowWriter(fps=1000/duration_per_frame))
+        plt.close(fig)
+
+def plot_layer_residuals_pca(layer_residuals_good, layer_residuals_bad, layer_index, 
+                            save_dir=None, plot_type='both', show_plot=True):
+    """Generate PCA plot (2D, 3D, or both) for a single layer's residuals."""
+    # Combine residuals
+    combined = torch.cat((layer_residuals_good, layer_residuals_bad), dim=0)
+    # Perform PCA
+    pca = PCA(n_components=3, random_state=42)
+    combined_3d = pca.fit_transform(combined.cpu().numpy())
+    
+    # Split back into good and bad
+    num_good = layer_residuals_good.shape[0]
+    good_3d = combined_3d[:num_good]
+    bad_3d = combined_3d[num_good:]
+    
+    explained_variance = pca.explained_variance_ratio_
+    
+    # Create directory if saving
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    
+    # Create 2D plot if requested
+    if plot_type in ['2d', 'both']:
+        fig_2d = plt.figure(figsize=(10, 8))
+        ax_2d = fig_2d.add_subplot(111)
+        ax_2d.scatter(good_3d[:, 0], good_3d[:, 1], c='royalblue', label='Good', alpha=0.7, s=20)
+        ax_2d.scatter(bad_3d[:, 0], bad_3d[:, 1], c='darkorange', label='Bad', alpha=0.7, s=20)
+        ax_2d.set_title(f'Layer {layer_index} - 2D PCA\n(Explained variance: PC1={explained_variance[0]:.2%}, PC2={explained_variance[1]:.2%})')
+        ax_2d.set_xlabel(f'PC1 ({explained_variance[0]:.2%})')
+        ax_2d.set_ylabel(f'PC2 ({explained_variance[1]:.2%})')
+        ax_2d.legend()
+        ax_2d.grid(True, alpha=0.3)
+        
+        if save_dir:
+            fig_2d.savefig(os.path.join(save_dir, 'pca_2d.png'), dpi=150, bbox_inches='tight')
+            plt.close(fig_2d)
+        elif show_plot:
+            plt.show()
+    
+    # Create 3D plot if requested
+    if plot_type in ['3d', 'both']:
+        fig_3d = plt.figure(figsize=(12, 9))
+        ax_3d = fig_3d.add_subplot(111, projection='3d')
+        ax_3d.scatter(good_3d[:, 0], good_3d[:, 1], good_3d[:, 2], 
+                     c='royalblue', label='Good', alpha=0.7, s=20)
+        ax_3d.scatter(bad_3d[:, 0], bad_3d[:, 1], bad_3d[:, 2], 
+                     c='darkorange', label='Bad', alpha=0.7, s=20)
+        ax_3d.set_title(f'Layer {layer_index} - 3D PCA\n(Total explained variance: {sum(explained_variance):.2%})')
+        ax_3d.set_xlabel(f'PC1 ({explained_variance[0]:.2%})')
+        ax_3d.set_ylabel(f'PC2 ({explained_variance[1]:.2%})')
+        ax_3d.set_zlabel(f'PC3 ({explained_variance[2]:.2%})')
+        ax_3d.legend()
+        ax_3d.view_init(elev=30, azim=45)
+        
+        if save_dir:
+            fig_3d.savefig(os.path.join(save_dir, 'pca_3d.png'), dpi=150, bbox_inches='tight')
+            plt.close(fig_3d)
+        elif show_plot:
+            plt.show()
+def create_layer_evolution_gif(residuals_good, residuals_bad, save_dir, 
+                              gif_type='3d', duration_per_frame=500, 
+                              prefix="", fixed_view=True):
+    """Create a GIF showing PCA evolution across layers."""
+    
+    num_layers = residuals_good.shape[1]
+    
+    # Pre-compute PCA for all layers
+    layer_pca_data = []
+    max_vals = {'x': float('-inf'), 'y': float('-inf'), 'z': float('-inf')}
+    min_vals = {'x': float('inf'), 'y': float('inf'), 'z': float('inf')}
+    
+    print("Pre-computing PCA for all layers...")
+    for layer_idx in range(num_layers):
+        layer_good = residuals_good[:, layer_idx, :]
+        layer_bad = residuals_bad[:, layer_idx, :]
+        
+        # Combine residuals
+        combined = torch.cat((layer_good, layer_bad), dim=0)
+        # Perform PCA
+        pca = PCA(n_components=3, random_state=42)
+        combined_3d = pca.fit_transform(combined.cpu().numpy())
+        
+        # Split back into good and bad
+        num_good = layer_good.shape[0]
+        good_3d = combined_3d[:num_good]
+        bad_3d = combined_3d[num_good:]
+        
+        explained_variance = pca.explained_variance_ratio_
+        
+        layer_pca_data.append({
+            'good': good_3d,
+            'bad': bad_3d,
+            'explained_variance': explained_variance,
+            'layer_idx': layer_idx
+        })
+        
+        # Update min/max for consistent axes
+        for data in [good_3d, bad_3d]:
+            max_vals['x'] = max(max_vals['x'], data[:, 0].max())
+            max_vals['y'] = max(max_vals['y'], data[:, 1].max())
+            max_vals['z'] = max(max_vals['z'], data[:, 2].max())
+            min_vals['x'] = min(min_vals['x'], data[:, 0].min())
+            min_vals['y'] = min(min_vals['y'], data[:, 1].min())
+            min_vals['z'] = min(min_vals['z'], data[:, 2].min())
+    
+    # Add some padding to the axes limits
+    for axis in ['x', 'y', 'z']:
+        padding = (max_vals[axis] - min_vals[axis]) * 0.1
+        max_vals[axis] += padding
+        min_vals[axis] -= padding
+    
+    if gif_type in ['3d', 'both']:
+        print("Creating 3D layer evolution GIF...")
+        # Create 3D layer evolution GIF
+        fig = plt.figure(figsize=(12, 9))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        def animate_3d(frame):
+            ax.clear()
+            layer_data = layer_pca_data[frame]
+            good_3d = layer_data['good']
+            bad_3d = layer_data['bad']
+            explained_variance = layer_data['explained_variance']
+            
+            ax.scatter(good_3d[:, 0], good_3d[:, 1], good_3d[:, 2], 
+                      c='royalblue', label='Good', alpha=0.7, s=20)
+            ax.scatter(bad_3d[:, 0], bad_3d[:, 1], bad_3d[:, 2], 
+                      c='darkorange', label='Bad', alpha=0.7, s=20)
+            
+            ax.set_title(f'Layer {frame} Evolution - 3D PCA\nTotal explained variance: {sum(explained_variance):.2%}')
+            ax.set_xlabel(f'PC1 ({explained_variance[0]:.2%})')
+            ax.set_ylabel(f'PC2 ({explained_variance[1]:.2%})')
+            ax.set_zlabel(f'PC3 ({explained_variance[2]:.2%})')
+            ax.legend()
+            
+            # Set consistent axes limits
+            ax.set_xlim(min_vals['x'], max_vals['x'])
+            ax.set_ylim(min_vals['y'], max_vals['y'])
+            ax.set_zlim(min_vals['z'], max_vals['z'])
+            
+            if fixed_view:
+                ax.view_init(elev=30, azim=45)
+            
+            return ax,
+        
+        anim_3d = FuncAnimation(fig, animate_3d, frames=num_layers, 
+                                interval=duration_per_frame, blit=False)
+        gif_path_3d = os.path.join(save_dir, f'{prefix}pca_3d_layer_evolution.gif')
+        anim_3d.save(gif_path_3d, writer=PillowWriter(fps=1000/duration_per_frame))
+        plt.close(fig)
+        print(f"Saved 3D layer evolution GIF to {gif_path_3d}")
+    
+    if gif_type in ['2d', 'both']:
+        print("Creating 2D layer evolution GIF...")
+        # Create 2D layer evolution GIF
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        def animate_2d(frame):
+            ax.clear()
+            layer_data = layer_pca_data[frame]
+            good_3d = layer_data['good']
+            bad_3d = layer_data['bad']
+            explained_variance = layer_data['explained_variance']
+            
+            ax.scatter(good_3d[:, 0], good_3d[:, 1], 
+                      c='royalblue', label='Good', alpha=0.7, s=20)
+            ax.scatter(bad_3d[:, 0], bad_3d[:, 1], 
+                      c='darkorange', label='Bad', alpha=0.7, s=20)
+            
+            ax.set_title(f'Layer {frame} Evolution - 2D PCA\nPC1={explained_variance[0]:.2%}, PC2={explained_variance[1]:.2%}')
+            ax.set_xlabel(f'PC1 ({explained_variance[0]:.2%})')
+            ax.set_ylabel(f'PC2 ({explained_variance[1]:.2%})')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            
+            # Set consistent axes limits
+            ax.set_xlim(min_vals['x'], max_vals['x'])
+            ax.set_ylim(min_vals['y'], max_vals['y'])
+            
+            return ax,
+        
+        anim_2d = FuncAnimation(fig, animate_2d, frames=num_layers, 
+                                interval=duration_per_frame, blit=False)
+        gif_path_2d = os.path.join(save_dir, f'{prefix}pca_2d_layer_evolution.gif')
+        anim_2d.save(gif_path_2d, writer=PillowWriter(fps=1000/duration_per_frame))
+        plt.close(fig)
+
+def save_pca_plots(residuals_good, residuals_bad, save_dir, 
+                  plot_type='both', create_evolution_gifs=False, 
+                  gif_type='3d', gif_duration_per_frame=500,
+                  fixed_gif_view=True, prefix=""):
+    """Save PCA plots for all layers with options for 2D/3D and evolution GIFs."""
+    
+    # Create main directory
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Save individual layer plots
+    print("Saving individual layer plots...")
+    for layer_idx in range(residuals_good.shape[1]):
+        layer_good = residuals_good[:, layer_idx, :]
+        layer_bad = residuals_bad[:, layer_idx, :]
+        
+        # Create layer directory
+        layer_dir = os.path.join(save_dir, f"layer_{layer_idx}")
+        os.makedirs(layer_dir, exist_ok=True)
+        
+        # Save static plots
+        plot_layer_residuals_pca(layer_good, layer_bad, layer_idx, 
+                                layer_dir, plot_type=plot_type, show_plot=False)
+    
+    # Create evolution GIFs if requested
+    if create_evolution_gifs:
+        print("Creating layer evolution GIFs...")
+        create_layer_evolution_gif(residuals_good, residuals_bad, save_dir,
+                                  gif_type=gif_type, 
+                                  duration_per_frame=gif_duration_per_frame,
+                                  fixed_view=fixed_gif_view,
+                                  prefix=prefix)
 
 def run():
     # Enable expandable segments to reduce memory fragmentation on multi-GPU setups.
@@ -403,6 +887,21 @@ def run():
 
     evaluator = Evaluator(settings, model)
 
+    # Initial PCA plots (before any trials)
+    if settings.plot_residuals_3d:
+        good_residuals_eval, bad_residuals_eval = evaluator.get_residuals_eval()
+        base_dir = os.path.join(settings.pca_plot_dir, f"base")
+        # Save base residuals
+        save_pca_plots(good_residuals_eval, bad_residuals_eval, base_dir, 
+                    plot_type='both', create_evolution_gifs=True, gif_type='both',
+                    gif_duration_per_frame=150, fixed_gif_view=True)
+        # Store base residuals for later comparison
+        base_residuals_good = good_residuals_eval
+        base_residuals_bad = bad_residuals_eval
+    else:
+        base_residuals_good = None
+        base_residuals_bad = None
+
     if settings.evaluate_model is not None:
         print()
         print(f"Loading model [bold]{settings.evaluate_model}[/]...")
@@ -594,6 +1093,23 @@ def run():
             model.abliterate(refusal_directions, direction_index, parameters)
         print("* Evaluating...")
         score, kl_divergence, refusals = evaluator.get_score()
+
+        # After evaluation in each trial
+        if settings.plot_residuals_3d:
+            good_residuals_eval, bad_residuals_eval = evaluator.get_residuals_eval()
+            trial_dir = os.path.join(settings.pca_plot_dir, f"{refusals}-refusals-{kl_divergence:.2f}-KL")
+            
+            # Save base and trial comparison plots
+            save_pca_plots_comparison(
+                base_residuals_good, base_residuals_bad,
+                good_residuals_eval, bad_residuals_eval,
+                trial_dir, 
+                plot_type='both', 
+                create_evolution_gifs=True, 
+                gif_type='both',
+                gif_duration_per_frame=150, 
+                fixed_gif_view=True
+            )
 
         elapsed_time = time.perf_counter() - start_time
         remaining_time = (elapsed_time / (trial_index - start_index)) * (

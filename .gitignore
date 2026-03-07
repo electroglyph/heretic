@@ -23,3 +23,7 @@ wheels/
 
 # Residual plots
 /plots/
+
+
+*.png
+*.gif

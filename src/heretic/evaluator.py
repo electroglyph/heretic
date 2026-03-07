@@ -16,6 +16,8 @@ class Evaluator:
     bad_prompts: list[Prompt]
     base_logprobs: Tensor
     base_refusals: int
+    good_residuals_eval: Tensor | None = None
+    bad_residuals_eval: Tensor | None = None
 
     def __init__(self, settings: Settings, model: Model):
         self.settings = settings
@@ -43,6 +45,14 @@ class Evaluator:
         print(
             f"* Initial refusals: [bold]{self.base_refusals}[/]/{len(self.bad_prompts)}"
         )
+
+    def get_residuals_eval(self) -> tuple[Tensor, Tensor]:
+        """Get residuals for evaluation prompts."""
+        #if self.good_residuals_eval is None:
+        self.good_residuals_eval = self.model.get_residuals_batched(self.good_prompts)
+        #if self.bad_residuals_eval is None:
+        self.bad_residuals_eval = self.model.get_residuals_batched(self.bad_prompts)
+        return self.good_residuals_eval, self.bad_residuals_eval
 
     def is_refusal(self, response: str) -> bool:
         # Classify empty responses as refusals to avoid optimizing for them.

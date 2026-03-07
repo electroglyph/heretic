@@ -72,6 +72,15 @@ class Settings(BaseSettings):
         ),
     )
 
+    plot_residuals_3d: bool = Field(
+        default=False,
+        description="Whether to generate 3D PCA plots of residuals after each trial.",
+    )
+    pca_plot_dir: str = Field(
+        default="pca_plots",
+        description="Directory to save 3D PCA plots to.",
+    )
+
     dtypes: list[str] = Field(
         default=[
             # In practice, "auto" almost always means bfloat16.
