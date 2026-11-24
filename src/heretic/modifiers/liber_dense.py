@@ -77,37 +77,50 @@ def optimize_sliced_matching(
         base_product_g = X_good @ W_base.T
         base_product_b = X_bad @ W_base.T
         row_norms = W_base.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        W_S = W_base[:, S_idx].contiguous()
+        bar_norm_sq = (
+            W_base.pow(2).sum(dim=1) - W_S.pow(2).sum(dim=1)
+        ).clamp_min(0.0)
+        X_good_S = X_good[:, S_idx].contiguous()
+        X_bad_S = X_bad[:, S_idx].contiguous()
+        Y_good_dev = Y_good.to(device)
+        Y_bad_dev = Y_bad.to(device)
     n_out = max(neighbor_count, 1)
+
+    opt = LBFGS([A, B], lr=1.0, max_iter=20, history_size=10,
+                line_search_fn="strong_wolfe")
 
     def closure() -> Tensor:
         opt.zero_grad(set_to_none=True)
-        upd_full = torch.zeros_like(W_base)
-        upd_full[:, S_idx] = B @ A
-        eff_norms = (W_base + upd_full).norm(dim=1).clamp_min(1e-8)
+        # Factored low-rank evaluation on the S slice only:
+        #   X @ upd_full.T == (X[:, S_idx] @ A.T) @ B.T
+        #   ||W_base + upd_full||_row^2 == ||W_base[:, bar_S]||_row^2 + ||W_S + B @ A||_row^2
+        # Avoids materializing a full [d_out, d_in] tensor or running a dense
+        # [N, d_in] @ [d_in, d_out] matmul on every L-BFGS inner evaluation.
+        dW_S = B @ A
+        eff_norms = (
+            bar_norm_sq + (W_S + dW_S).pow(2).sum(dim=1)
+        ).clamp_min(1e-16).sqrt()
         # Row-norm rescale applied to outputs as a per-column factor.
         scale = (row_norms.squeeze(1) / eff_norms).unsqueeze(0)
-        new_good = (base_product_g + (X_good @ upd_full.T)) * scale
-        new_bad = (base_product_b + (X_bad @ upd_full.T)) * scale
-        loss_p = (new_good - Y_good.to(device)).pow(2).mean()
-        loss_s = (_knn_mean_distances(new_bad, Y_good.to(device), n_out).mean()
+        new_good = (base_product_g + (X_good_S @ A.T) @ B.T) * scale
+        new_bad = (base_product_b + (X_bad_S @ A.T) @ B.T) * scale
+        loss_p = (new_good - Y_good_dev).pow(2).mean()
+        loss_s = (_knn_mean_distances(new_bad, Y_good_dev, n_out).mean()
                   - overcorrect_weight
-                  * _knn_mean_distances(new_bad, Y_bad.to(device),
-                                        n_out).mean())
+                  * _knn_mean_distances(new_bad, Y_bad_dev, n_out).mean())
         loss = preserve_weight * loss_p + steer_weight * loss_s
         loss.backward()
         return loss
 
     # Outer steps (NOT a single LBFGS call): a single strong-Wolfe call can
-    # stall at the init point; outer restarts converge. ARA-validated.
+    # stall at the init point; outer steps converge. ARA-validated.
     for _ in range(max(n_steps, 1)):
-        opt = LBFGS([A, B], lr=1.0, max_iter=20, history_size=10,
-                    line_search_fn="strong_wolfe")
         opt.step(closure)
     opt.zero_grad(set_to_none=True)
     with torch.no_grad():
-        upd_full = torch.zeros_like(W_base)
-        upd_full[:, S_idx] = B @ A
-        W_new = W_base + upd_full
+        W_new = W_base.clone()
+        W_new[:, S_idx] = W_S + (B @ A)
         # Restore exact base row norms (keeps unselected behavior bit-close).
         W_new = W_new * (row_norms
                          / W_new.norm(dim=1, keepdim=True).clamp_min(1e-8))

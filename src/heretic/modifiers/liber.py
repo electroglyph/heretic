@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -125,7 +125,7 @@ class Settings(BaseModel):
         default=4,
         description="Prompts per full-model backward pass.",
     )
-    n_optimization_steps: PositiveInt = Field(default=25)
+    n_optimization_steps: PositiveInt = Field(default=5)
     skip_scan: bool = Field(
         default=False,
         description="Skip the post-write mixing scan (assume clean writers). "
@@ -176,9 +176,20 @@ class LiberARA(Modifier[LiberParameters]):
         accept_ids = token_ids(tok, ACCEPT_WORDS)
         refuse_ids = token_ids(tok, REFUSE_WORDS)
 
-        print("Capturing residual planes for refusal direction...")
-        mean_good = self._mean_planes(raw, layers, tok, good_texts, system)
-        mean_bad = self._mean_planes(raw, layers, tok, bad_texts, system)
+        print("Capturing residual planes and writer I/O (once, reused across all trials)...")
+        writers_by_layer = {
+            li: self._writer_list(model, layers, li)
+            for li in range(len(layers))
+        }
+        mean_good, io_good = self._mean_planes(
+            raw, layers, tok, good_texts, system, writers_by_layer)
+        mean_bad, io_bad = self._mean_planes(
+            raw, layers, tok, bad_texts, system, writers_by_layer)
+        self._writer_io: Dict[Tuple[int, int], Tuple[Tensor, Tensor, Tensor, Tensor]] = {}
+        for key, (xg, yg) in io_good.items():
+            if key in io_bad:
+                xb, yb = io_bad[key]
+                self._writer_io[key] = (xg, xb, yg, yb)
         self.r_planes = refusal_direction(mean_bad, mean_good)  # (P, D) cpu
         self.accept_ids = accept_ids
         self.refuse_ids = refuse_ids
@@ -304,16 +315,17 @@ class LiberARA(Modifier[LiberParameters]):
             print(f"LiberARA post-write scan: registry write failed ({exc}); "
                   f"continuing without cache.")
 
-    def _mean_planes(self, raw, layers, tok, texts, system) -> Tensor:
+    def _mean_planes(self, raw, layers, tok, texts, system,
+                     writers_by_layer=None):
         from .liber_targets import format_prefill_texts
         device = next(raw.parameters()).device
         P, D = len(layers) + 1, self._hidden(raw, layers)
         total = torch.zeros(P, D, dtype=torch.float64)
         n = 0
-        enc_all = format_prefill_texts(tok, texts, system)
-        ids_all, mask_all = enc_all["input_ids"], enc_all["attention_mask"]
         buf: Dict[int, Tensor] = {}
         last: Dict[str, Tensor] = {}
+        w_xs: Dict[Tuple[int, int], list] = {}
+        w_ys: Dict[Tuple[int, int], list] = {}
         handles = []
 
         def pre(i: int):
@@ -327,16 +339,36 @@ class LiberARA(Modifier[LiberParameters]):
             if torch.is_tensor(t):
                 last["h"] = t[:, -1, :].detach().float().cpu()
 
+        def w_hook(key: Tuple[int, int]):
+            def _fn(_m, args, out):
+                x = args[0] if isinstance(args, tuple) else args
+                t = out[0] if isinstance(out, tuple) else out
+                if torch.is_tensor(x) and torch.is_tensor(t):
+                    # Store in bfloat16 on CPU (~1.8 GB for 1400 prompts x 72
+                    # writers); cast to float32 on device per module in modify_model.
+                    w_xs.setdefault(key, []).append(
+                        x[:, -1, :].detach().to(torch.bfloat16).cpu())
+                    w_ys.setdefault(key, []).append(
+                        t[:, -1, :].detach().to(torch.bfloat16).cpu())
+            return _fn
+
         for i, layer in enumerate(layers):
             handles.append(layer.register_forward_pre_hook(pre(i)))
         handles.append(layers[-1].register_forward_hook(post))
+        if writers_by_layer:
+            for li, wlist in writers_by_layer.items():
+                for wi, wmod in enumerate(wlist):
+                    if wmod.weight.shape[0] == D:
+                        handles.append(
+                            wmod.register_forward_hook(w_hook((li, wi))))
         try:
-            for s in range(0, len(texts), 8):
+            for s in range(0, len(texts), 32):
                 buf.clear()
                 last.clear()
+                enc = format_prefill_texts(tok, texts[s:s + 32], system)
                 with torch.no_grad():
-                    raw(input_ids=ids_all[s:s + 8].to(device),
-                        attention_mask=mask_all[s:s + 8].to(device),
+                    raw(input_ids=enc["input_ids"].to(device),
+                        attention_mask=enc["attention_mask"].to(device),
                         use_cache=False)
                 bsz = buf[0].shape[0]
                 planes = torch.empty(bsz, P, D)
@@ -348,7 +380,14 @@ class LiberARA(Modifier[LiberParameters]):
         finally:
             for h in handles:
                 h.remove()
-        return (total / max(n, 1)).float()
+        mean_p = (total / max(n, 1)).float()
+        if writers_by_layer is None:
+            return mean_p
+        io_out = {
+            k: (torch.cat(w_xs[k], dim=0), torch.cat(w_ys[k], dim=0))
+            for k in w_xs
+        }
+        return mean_p, io_out
 
     @staticmethod
     def _hidden(raw, layers) -> int:
@@ -411,8 +450,15 @@ class LiberARA(Modifier[LiberParameters]):
                     continue  # not a residual writer (e.g. gate/up)
                 spec = self._scan_specs.get(l_idx, {}).get(wi, {})
                 base = base_mod.weight.detach().float()
-                Xg, Xb, Yg, Yb = self._last_position_inputs(
-                    raw, base_mod, tok, l_idx, device)
+                cached_io = getattr(self, "_writer_io", {}).get((l_idx, wi))
+                if cached_io is not None:
+                    Xg = cached_io[0].float().to(device)
+                    Xb = cached_io[1].float().to(device)
+                    Yg = cached_io[2].float().to(device)
+                    Yb = cached_io[3].float().to(device)
+                else:
+                    Xg, Xb, Yg, Yb = self._last_position_inputs(
+                        raw, base_mod, tok, l_idx, device)
                 if Xg is None:
                     continue
                 self._snapshot(base_mod)
