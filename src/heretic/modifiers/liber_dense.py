@@ -3,24 +3,115 @@
 #
 # LiberARA column-sliced multi-rank LoRA for 2D writer matrices (experimental).
 #
-# Two corrections to stock ARA on write atoms (columns):
-# 1. Column slicing: only the top-(1-Q) refusal-active columns S are LoRA'd;
-#    the rest get closed-form ridge removal. Stock ARA's row-norm (dim=1)
-#    rescaling leaks into unselected columns; dim=0 column-norm keeps them
-#    bit-identical while preserving each selected atom's magnitude.
-# 2. Per-prompt acceptance-gradient target with the refusal component
-#    subtracted (stock mean-vector target keeps 100% of the refusal since
-#    a_l ⊥ r) plus a harmlessness-basis KL penalty instead of isotropic MSE
-#    alone. Reference: heretic2 §2.1–2.3, §3.3.
+# Sliced output matching on write atoms (columns): only the top-(1-Q)
+# refusal-active columns S are optimized, toward the good-output distribution
+# (kNN toward good, overcorrected away from bad, ARA-style), with isotropic
+# preserve on good inputs and row-norm rescaling. Unselected columns stay
+# bit-identical. Reference: heretic2 §2.1–2.3, §3.3.
+#
+# What did NOT survive validation (local 3090, Spark-X2.6-4B, Nov 2026):
+# - Analytic -r shift target (optimize_column_sliced, removed): LBFGS stalled
+#   after 1 eval from N(0, 0.01) init; even kaiming + outer steps moved weights
+#   without moving refusals (0/12 flips at max steer). Formulation inert.
+# - Closed-form ridge removal on bar columns: inert alone, adds nothing on top
+#   of sliced matching. Dropped from the dense path (kept for the leaky path
+#   via apply_s_ridge).
+# - Harmlessness-basis (U_H) KL penalty: zero effect at rank 7 and rank 64,
+#   w_kl 5 and 20, with and without row-norm. Dropped from the dense path.
 
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 from torch import Tensor
 from torch.optim import LBFGS
+
+
+def _knn_mean_distances(a: Tensor, b: Tensor, k: int) -> Tensor:
+    """Mean distance of each row of a to its k nearest rows of b."""
+    k = max(1, min(k, b.shape[0]))
+    distances = torch.cdist(a, b)
+    nearest, _ = distances.topk(k, dim=1, largest=False)
+    return nearest.mean(dim=1)
+
+
+def optimize_sliced_matching(
+    W_base: Tensor,
+    X_good: Tensor,
+    X_bad: Tensor,
+    Y_good: Tensor,
+    Y_bad: Tensor,
+    S_idx: Tensor,
+    preserve_weight: float,
+    steer_weight: float,
+    overcorrect_weight: float,
+    neighbor_count: int,
+    lora_rank: int,
+    n_steps: int,
+    seed: int = 42,
+) -> Tensor:
+    """Sliced output-matching redirect on 2D writer matrices.
+
+    Optimizes a low-rank update to the S columns so bad-input outputs move
+    toward the good-output distribution (and away from bad outputs,
+    overcorrected), while good-input outputs are preserved. Row norms are
+    rescaled to the base norms (validated: halves first-token KL vs no norm).
+
+    Returns the full updated weight (only S columns changed).
+    """
+    device = W_base.device
+    k = S_idx.numel()
+    eff_rank = max(1, min(lora_rank, k, W_base.shape[0]))
+    gen = torch.Generator(device=device).manual_seed(seed)
+    # Kaiming init (NOT near-zero): with B=0, near-zero A stalls strong-Wolfe
+    # line search at the init point (1 eval, zero update). ARA-validated.
+    A = torch.empty((eff_rank, k), device=device, dtype=torch.float32)
+    torch.nn.init.kaiming_uniform_(A, a=math.sqrt(5), generator=gen)
+    B = torch.zeros((W_base.shape[0], eff_rank), device=device,
+                    dtype=torch.float32)
+    A.requires_grad_(True)
+    B.requires_grad_(True)
+    with torch.no_grad():
+        base_product_g = X_good @ W_base.T
+        base_product_b = X_bad @ W_base.T
+        row_norms = W_base.norm(dim=1, keepdim=True).clamp_min(1e-8)
+    n_out = max(neighbor_count, 1)
+
+    def closure() -> Tensor:
+        opt.zero_grad(set_to_none=True)
+        upd_full = torch.zeros_like(W_base)
+        upd_full[:, S_idx] = B @ A
+        eff_norms = (W_base + upd_full).norm(dim=1).clamp_min(1e-8)
+        # Row-norm rescale applied to outputs as a per-column factor.
+        scale = (row_norms.squeeze(1) / eff_norms).unsqueeze(0)
+        new_good = (base_product_g + (X_good @ upd_full.T)) * scale
+        new_bad = (base_product_b + (X_bad @ upd_full.T)) * scale
+        loss_p = (new_good - Y_good.to(device)).pow(2).mean()
+        loss_s = (_knn_mean_distances(new_bad, Y_good.to(device), n_out).mean()
+                  - overcorrect_weight
+                  * _knn_mean_distances(new_bad, Y_bad.to(device),
+                                        n_out).mean())
+        loss = preserve_weight * loss_p + steer_weight * loss_s
+        loss.backward()
+        return loss
+
+    # Outer steps (NOT a single LBFGS call): a single strong-Wolfe call can
+    # stall at the init point; outer restarts converge. ARA-validated.
+    for _ in range(max(n_steps, 1)):
+        opt = LBFGS([A, B], lr=1.0, max_iter=20, history_size=10,
+                    line_search_fn="strong_wolfe")
+        opt.step(closure)
+    opt.zero_grad(set_to_none=True)
+    with torch.no_grad():
+        upd_full = torch.zeros_like(W_base)
+        upd_full[:, S_idx] = B @ A
+        W_new = W_base + upd_full
+        # Restore exact base row norms (keeps unselected behavior bit-close).
+        W_new = W_new * (row_norms
+                         / W_new.norm(dim=1, keepdim=True).clamp_min(1e-8))
+    return W_new
 
 
 def select_columns(
@@ -72,79 +163,7 @@ def ridge_remove_columns(
     return W
 
 
-def optimize_column_sliced(
-    W_base: Tensor,
-    X_good: Tensor,
-    X_bad: Tensor,
-    r: Tensor,
-    G_bad: Tensor,
-    U_H: Optional[Tensor],
-    S_idx: Tensor,
-    alpha_S: Tensor,
-    gamma: float,
-    lora_rank: int,
-    w_preserve: float,
-    w_kl_basis: float,
-    w_steer: float,
-    n_steps: int,
-    seed: int = 42,
-    preserve_col_magnitudes: bool = True,
-) -> Tensor:
-    """Rank-R LBFGS on the column slice S toward the per-prompt target.
-
-    Target shift on bad inputs: -alpha_tok r^T + gamma alpha_tok G_bad.
-    Loss: w_preserve * (isotropic MSE + w_kl_basis * basis-projected MSE)
-    + w_steer * MSE(delta_Y_bad, target). Column norms (dim=0) restored.
-    Returns the full updated weight (only S columns changed).
-    """
-    device = W_base.device
-    W_S_base = W_base[:, S_idx].clone()
-    col_norms = W_S_base.norm(dim=0, keepdim=True).clamp_min(1e-8)
-    Xg = X_good[:, S_idx]
-    Xb = X_bad[:, S_idx]
-    k = S_idx.numel()
-    eff_rank = max(1, min(lora_rank, k, W_base.shape[0]))
-    gen = torch.Generator(device=device).manual_seed(seed)
-    A = torch.randn((eff_rank, k), generator=gen, device=device,
-                    dtype=torch.float32) * 0.01
-    B = torch.zeros((W_base.shape[0], eff_rank), device=device,
-                    dtype=torch.float32)
-    A.requires_grad_(True)
-    B.requires_grad_(True)
-    with torch.no_grad():
-        alpha_tok = (Xb @ alpha_S).unsqueeze(-1)
-        target = (-alpha_tok * r.unsqueeze(0)
-                  + gamma * alpha_tok * G_bad.to(device))
-    # heretic2 §3.3 exact: single LBFGS step with max_iter=n_steps
-    # (strong_wolfe, history 10, lr 1.0). NOT an outer loop of steps.
-    opt = LBFGS([A, B], lr=1.0, max_iter=max(n_steps, 1), history_size=10,
-                line_search_fn="strong_wolfe")
-
-    def closure() -> Tensor:
-        opt.zero_grad(set_to_none=True)
-        W_S = W_S_base + (B @ A)
-        if preserve_col_magnitudes:
-            W_S = W_S * (col_norms
-                         / W_S.norm(dim=0, keepdim=True).clamp_min(1e-8))
-        dW = W_S - W_S_base
-        dYg = Xg @ dW.T
-        dYb = Xb @ dW.T
-        loss_p = dYg.pow(2).mean()
-        if U_H is not None and w_kl_basis > 0:
-            loss_p = loss_p + w_kl_basis * ((dYg @ U_H.to(device)).pow(2)
-                                           .mean())
-        loss_s = torch.nn.functional.mse_loss(dYb, target)
-        loss = w_preserve * loss_p + w_steer * loss_s
-        loss.backward()
-        return loss
-
-    opt.step(closure)
-    opt.zero_grad(set_to_none=True)
-    with torch.no_grad():
-        W_S = W_S_base + (B @ A)
-        if preserve_col_magnitudes:
-            W_S = W_S * (col_norms
-                         / W_S.norm(dim=0, keepdim=True).clamp_min(1e-8))
-        W_new = W_base.clone()
-        W_new[:, S_idx] = W_S
-    return W_new
+def _removed_optimize_column_sliced():
+    """Removed Nov 2026: analytic -r target proven inert (0/12 flips at max
+    steer, LBFGS stalled after 1 eval). See module header + experiments log.
+    Replaced by optimize_sliced_matching. Git history preserves the code."""

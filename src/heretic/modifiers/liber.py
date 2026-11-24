@@ -4,16 +4,17 @@
 # LiberARA — LiberShift-informed ARA (experimental).
 #
 # Keeps stock ARA untouched. Differences from ARA, all behind this plugin:
-# 1. Fused 3D MoE experts get a closed-form gate-weighted ridge redirect
-#    (stock ARA never sees them: get_layer_modules only matches per-expert
-#    nn.Linear). See liber_moe.
-# 2. 2D writers (mixers, dense down_proj) get a column-sliced rank-R LoRA:
-#    top-(1-Q) refusal-active columns steered toward per-prompt
-#    acceptance gradients, the rest closed-form ridge removal, dim=0
-#    column-norm preservation (stock row-norm leaks into unselected
-#    columns), plus a harmlessness-basis KL penalty. See liber_dense.
-# 3. All targets are computed at the prefilled <think></think> answer-start
-#    position via full-model backward, never from kNN geometry.
+# 1. 2D writers (o_proj, dense down_proj) get a column-sliced rank-R update:
+#    only the top-(1-Q) refusal-active columns are optimized, toward the
+#    good-output distribution (kNN toward good, overcorrected away from bad)
+#    with isotropic preserve on good inputs and exact row-norm restoration.
+#    Unselected columns stay bit-identical. See liber_dense.
+#    (Nov 2026: validated on Spark-X2.6-4B; replaced the inert analytic -r
+#    LBFGS core, the inert bar-column ridge removal, and the zero-effect
+#    harmlessness-basis penalty. MoE support removed as unvalidated.)
+# 2. All targets are computed at the prefilled <think></think> answer-start
+#    position. Writers with a proven post-write leak (see liber_conv) take a
+#    closed-form S-span ridge instead of the sliced match.
 #
 # Weight-edit mechanics: base weights are edited directly (PEFT cannot
 # target fused 3D params). init() still calls model.apply_lora() so the
@@ -50,8 +51,7 @@ from .liber_conv import (
     save_registry,
     scan_post_ops,
 )
-from .liber_dense import optimize_column_sliced, ridge_remove_columns, select_columns
-from .liber_moe import apply_moe_ridge, collect_moe_moments, find_fused_moe
+from .liber_dense import optimize_sliced_matching, select_columns
 from .liber_targets import (
     ACCEPT_WORDS,
     REFUSE_WORDS,
@@ -72,6 +72,8 @@ class LiberParameters(Serializable):
     lambda_preserve: float
     top_atom_fraction: float
     steer_weight: float
+    overcorrect_weight: float = 0.9687
+    neighbor_count: int = 3
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -84,7 +86,12 @@ class LiberParameters(Serializable):
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Serializable":
-        return LiberParameters(**data)
+        # Tolerant: studies started before overcorrect_weight/neighbor_count
+        # existed lack those keys; fall back to defaults (fresh studies always
+        # write them via suggest_parameters).
+        full = {"overcorrect_weight": 0.9687, "neighbor_count": 3}
+        full.update(data)
+        return LiberParameters(**full)
 
 
 class Settings(BaseModel):
@@ -114,20 +121,11 @@ class Settings(BaseModel):
         default=16,
         description="Rank of the column-sliced B @ A_S update on 2D writers.",
     )
-    w_preserve: float = Field(default=1.0)
-    w_kl_basis: float = Field(
-        default=5.0,
-        description="Weight of the harmlessness-basis KL penalty.",
-    )
     grad_batch_size: PositiveInt = Field(
         default=4,
         description="Prompts per full-model backward pass.",
     )
     n_optimization_steps: PositiveInt = Field(default=25)
-    use_moe_ridge: bool = Field(
-        default=True,
-        description="Apply closed-form ridge redirect on fused 3D MoE.",
-    )
     skip_scan: bool = Field(
         default=False,
         description="Skip the post-write mixing scan (assume clean writers). "
@@ -182,35 +180,6 @@ class LiberARA(Modifier[LiberParameters]):
         mean_good = self._mean_planes(raw, layers, tok, good_texts, system)
         mean_bad = self._mean_planes(raw, layers, tok, bad_texts, system)
         self.r_planes = refusal_direction(mean_bad, mean_good)  # (P, D) cpu
-
-        # Harmlessness basis FIRST, from top-1 logprob gradients (exact
-        # libershift/redirect.py:top_token_gradient contract), so bad
-        # gradients can be orthogonalized against it (Theorem 5: P_{r,U_H}).
-        print("Computing harmlessness basis (good, top-1)...")
-        top_grads = top_token_gradients(
-            raw, layers, tok, good_texts, system,
-            self.settings.grad_batch_size)  # (N_good, n_layers, D)
-        # Rank must be < n_prompts: centered rows sum to zero, so the last
-        # Gram eigenvector is degenerate (exact redirect.py behaves the same;
-        # capping avoids a noise-amplified basis row).
-        _rank = min(64, max(1, top_grads.shape[0] - 1))
-        self.U_H = harmlessness_basis(top_grads, rank=_rank)
-        # U_H[l] corresponds to layer l output = plane l+1.
-        U_dict = {l: self.U_H[l].T.contiguous()  # (D, K) for projection
-                  for l in range(len(layers))}
-        print("Computing per-prompt acceptance gradients (bad)...")
-        self.G_bad = per_prompt_acceptance_gradients(
-            raw, layers, tok, bad_texts, accept_ids, refuse_ids,
-            self.r_planes, system, U_dict, self.settings.grad_batch_size)
-        # Mean redirect target a_l = unit(mean orth grad), matching
-        # redirect.py:target(grad_orth): unit after orthogonalization.
-        # Each G_bad row is already orth vs (r, U_H) and unit; the mean
-        # stays orth but must be re-normalized to unit.
-        self.a_mean = {}
-        for l in self.G_bad:
-            m = self.G_bad[l].mean(dim=0)
-            n = float(m.norm().item())
-            self.a_mean[l] = (m / max(n, 1e-12)).cpu()
         self.accept_ids = accept_ids
         self.refuse_ids = refuse_ids
         self.system = system
@@ -219,35 +188,47 @@ class LiberARA(Modifier[LiberParameters]):
         self._scan_fp = ""
         self._run_post_scan(model, layers, tok)
 
-        # Fused-MoE moment cache: collect_moe_moments depends only on base
-        # weights + calibration texts (never on trial params), so collect
-        # ONCE over the full layer range here instead of ~350 forwards per
-        # trial in modify_model. apply_moe_ridge iterates the trial's own
-        # layer_range and skips layers absent from the dicts, so per-trial
-        # results are identical. Dense architectures (no fused MoE
-        # anywhere) skip both collection and application entirely.
-        self._moe_layers = [l for l in range(len(layers))
-                            if find_fused_moe(layers[l]) is not None]
-        if self.settings.use_moe_ridge and self._moe_layers:
-            print("Caching fused-MoE activation moments "
-                  "(once, reused by every trial)...")
-            _good_t = self._prefill_strings(
-                tok, [p.user for p in self.good_prompts], system)
-            _bad_t = self._prefill_strings(
-                tok, [p.user for p in self.bad_prompts], system)
-            _full = range(len(layers))
-            self._moe_mu_g, self._moe_n_g = collect_moe_moments(
-                raw, layers, tok, _good_t, _full, batch_size=4)
-            self._moe_mu_b, self._moe_n_b = collect_moe_moments(
-                raw, layers, tok, _bad_t, _full, batch_size=4)
+        # Both gradient computations below serve ONLY the leaky-writer
+        # path -- clean dense models skip them entirely (top-1 grads over
+        # N_good prompts was the dominant init cost). The dense
+        # output-matching path needs neither.
+        _need_grads = any(
+            spec.get("leaky", False)
+            for ws in self._scan_specs.values()
+            for spec in ws.values())
+        self.G_bad: Dict[int, Tensor] = {}
+        self.a_mean: Dict[int, Tensor] = {}
+        self.U_H = None
+        if _need_grads:
+            # Harmlessness basis from top-1 logprob gradients, so bad
+            # gradients can be orthogonalized against it (P_{r,U_H}).
+            print("Computing harmlessness basis (good, top-1)...")
+            top_grads = top_token_gradients(
+                raw, layers, tok, good_texts, system,
+                self.settings.grad_batch_size)  # (N_good, n_layers, D)
+            # Rank must be < n_prompts: centered rows sum to zero, so the
+            # last Gram eigenvector is degenerate; capping avoids a
+            # noise-amplified basis row.
+            _rank = min(64, max(1, top_grads.shape[0] - 1))
+            self.U_H = harmlessness_basis(top_grads, rank=_rank)
+            # U_H[l] corresponds to layer l output = plane l+1.
+            U_dict = {l: self.U_H[l].T.contiguous()  # (D, K)
+                      for l in range(len(layers))}
+            print("Computing per-prompt acceptance gradients (bad)...")
+            self.G_bad = per_prompt_acceptance_gradients(
+                raw, layers, tok, bad_texts, accept_ids, refuse_ids,
+                self.r_planes, system, U_dict,
+                self.settings.grad_batch_size)
+            # Mean redirect target a_l = unit(mean orth grad). Each G_bad
+            # row is already orth vs (r, U_H) and unit; the mean stays orth
+            # but must be re-normalized to unit.
+            for l in self.G_bad:
+                m = self.G_bad[l].mean(dim=0)
+                n = float(m.norm().item())
+                self.a_mean[l] = (m / max(n, 1e-12)).cpu()
         else:
-            if not self.settings.use_moe_ridge:
-                print("LiberARA MoE ridge disabled by settings.")
-            else:
-                print("LiberARA MoE ridge: no fused MoE found — moments and "
-                      "per-trial ridge skipped (dense fast path).")
-            self._moe_mu_g, self._moe_n_g = {}, 0
-            self._moe_mu_b, self._moe_n_b = {}, 0
+            print("LiberARA gradient targets skipped (clean dense writers: "
+                  "no leaky layers).")
 
     def _writer_list(self, model, layers, l_idx) -> list:
         """Unwrapped 2D writers in deterministic get_layer_modules order."""
@@ -401,6 +382,11 @@ class LiberARA(Modifier[LiberParameters]):
                 "top_atom_fraction", 0.05, 0.15),
             steer_weight=trial.suggest_float("steer_weight", 0.0001, 1.0,
                                              log=True),
+            overcorrect_weight=trial.suggest_float(
+                "overcorrect_weight", 0.0, 1.3),
+            neighbor_count=trial.suggest_int(
+                "neighbor_count", 1,
+                min(15, len(self.good_prompts), len(self.bad_prompts))),
         )
 
     # -- edit ----------------------------------------------------------------
@@ -415,59 +401,24 @@ class LiberARA(Modifier[LiberParameters]):
         self._snap = {}
         r = self.r_planes.to(device=device, dtype=torch.float32)
 
-        # Stage 2: fused MoE ridge (closed form, no LoRA). Moments were
-        # cached once at init (trial-independent); each trial only applies.
-        _moe_edited = 0
-        if self.settings.use_moe_ridge and self._moe_layers:
-            self._snapshot_fused(layers, layer_range)
-            stats = apply_moe_ridge(
-                raw, layers, self._moe_mu_g, self._moe_n_g,
-                self._moe_mu_b, self._moe_n_b,
-                r.mean(dim=0).cpu(), self.a_mean, layer_range,
-                parameters.quantile_q, parameters.gamma,
-                parameters.lambda_preserve,
-                self.settings.preserve_col_magnitudes)
-            print(f"LiberARA MoE ridge: {stats}")
-            _moe_edited = int(stats.get("moe_layers_edited", 0))
-
-        # Stage 3: column-sliced rank-R LoRA on 2D writers, or S-span
-        # closed-form ridge on writers with a proven post-write leak.
-        # Stage-2 MoE edit shifts downstream activations, so recapture the
-        # per-prompt acceptance gradients post-MoE (heretic2 §4: recapture)
-        # — but only when MoE actually edited (dense models skip the cost).
-        if self.settings.use_moe_ridge and _moe_edited > 0:
-            from .liber_targets import per_prompt_acceptance_gradients as _ppg
-            _U_dict = {l: self.U_H[l].T.contiguous()
-                       for l in range(len(layers))}
-            _G_new = _ppg(raw, layers, tok,
-                          [p.user for p in self.bad_prompts],
-                          self.accept_ids, self.refuse_ids,
-                          self.r_planes, self.system, _U_dict,
-                          self.settings.grad_batch_size)
-            self.G_bad = _G_new
-            for _l in self.G_bad:
-                _m = self.G_bad[_l].mean(dim=0)
-                self.a_mean[_l] = (_m / max(float(_m.norm().item()), 1e-12)).cpu()
+        # Column-sliced output matching on 2D writers, or S-span closed-form
+        # ridge on writers with a proven post-write leak.
         for l_idx in layer_range:
             r_l = r[l_idx + 1]
-            a_l = self.a_mean[l_idx].to(device=device, dtype=torch.float32)
-            G_l = self.G_bad[l_idx].to(device=device, dtype=torch.float32)
-            # U_H[l] is (rank, hidden) for layer l output; project needs
-            # (hidden, rank) i.e. U_H[l].T. (Stack holds planes 1..n, so
-            # index l_idx directly — l_idx+1 would drop the last layer.)
-            U_l = self.U_H[l_idx].T.to(device=device, dtype=torch.float32)
             for wi, base_mod in enumerate(self._writer_list(
                     model, layers, l_idx)):
                 if base_mod.weight.shape[0] != r_l.shape[0]:
                     continue  # not a residual writer (e.g. gate/up)
                 spec = self._scan_specs.get(l_idx, {}).get(wi, {})
                 base = base_mod.weight.detach().float()
-                Xg, Xb = self._last_position_inputs(
+                Xg, Xb, Yg, Yb = self._last_position_inputs(
                     raw, base_mod, tok, l_idx, device)
                 if Xg is None:
                     continue
                 self._snapshot(base_mod)
                 if spec.get("leaky"):
+                    a_l = self.a_mean[l_idx].to(device=device,
+                                                dtype=torch.float32)
                     S = build_leak_span(r_l.cpu(), [spec]).to(device)
                     a_orth = a_l - S @ (S.T @ a_l)
                     W_new, info = apply_s_ridge(
@@ -477,24 +428,23 @@ class LiberARA(Modifier[LiberParameters]):
                         self.settings.preserve_col_magnitudes)
                     print(f"LiberARA S-ridge l{l_idx}w{wi}: {info}")
                 else:
-                    S_idx, bar_idx, rho = select_columns(
+                    # Validated dense path (Nov 2026): sliced output matching.
+                    # The old analytic -r LBFGS core was proven inert (0/12
+                    # flips at max steer; LBFGS stalled after 1 eval), the
+                    # U_H basis penalty had zero effect at any rank/weight,
+                    # and bar-column ridge removal added nothing measurable.
+                    S_idx, _, _ = select_columns(
                         base.to(device), Xg, Xb, r_l.to(device),
                         1.0 / max(parameters.steer_weight, 1e-8),
                         parameters.top_atom_fraction)
-                    alpha_all = (base.to(device).T
-                                 @ r_l.to(device))
-                    W1 = ridge_remove_columns(
-                        base.to(device), bar_idx, alpha_all, rho,
-                        r_l.to(device),
-                        self.settings.preserve_col_magnitudes)
-                    W_new = optimize_column_sliced(
-                        W1, Xg, Xb, r_l.to(device), G_l, U_l, S_idx,
-                        alpha_all[S_idx], parameters.gamma,
-                        self.settings.lora_rank, self.settings.w_preserve,
-                        self.settings.w_kl_basis, parameters.steer_weight,
-                        self.settings.n_optimization_steps,
-                        preserve_col_magnitudes=(
-                            self.settings.preserve_col_magnitudes))
+                    W_new = optimize_sliced_matching(
+                        base.to(device), Xg, Xb, Yg, Yb, S_idx,
+                        parameters.lambda_preserve,
+                        parameters.steer_weight,
+                        parameters.overcorrect_weight,
+                        parameters.neighbor_count,
+                        self.settings.lora_rank,
+                        self.settings.n_optimization_steps)
                 with torch.no_grad():
                     base_mod.weight.data.copy_(
                         W_new.to(base_mod.weight.dtype))
@@ -524,17 +474,23 @@ class LiberARA(Modifier[LiberParameters]):
         return out
 
     def _last_position_inputs(self, raw, module, tok, l_idx, device):
-        """Last-position inputs of one Linear for good and bad prompts."""
+        """Last-position inputs AND outputs of one Linear for good and bad."""
         good_t = self._prefill_strings(
             tok, [p.user for p in self.good_prompts], self.system)
         bad_t = self._prefill_strings(
             tok, [p.user for p in self.bad_prompts], self.system)
         acc: Dict[str, Tensor] = {}
 
-        def hook(_m, args):
+        def pre_hook(_m, args):
             x = args[0] if isinstance(args, tuple) else args
             acc.setdefault("xs", []).append(
                 x[:, -1, :].detach().float().cpu())
+
+        def post_hook(_m, _args, out):
+            t = out[0] if isinstance(out, tuple) else out
+            if torch.is_tensor(t):
+                acc.setdefault("ys", []).append(
+                    t[:, -1, :].detach().float().cpu())
 
         outs = {}
         prev_side = getattr(tok, "padding_side", None)
@@ -542,7 +498,8 @@ class LiberARA(Modifier[LiberParameters]):
         try:
             for key, texts in (("good", good_t), ("bad", bad_t)):
                 acc.clear()
-                h = module.register_forward_pre_hook(hook)
+                h1 = module.register_forward_pre_hook(pre_hook)
+                h2 = module.register_forward_hook(post_hook)
                 try:
                     for s in range(0, len(texts), 8):
                         enc = tok(texts[s:s + 8], return_tensors="pt",
@@ -551,29 +508,20 @@ class LiberARA(Modifier[LiberParameters]):
                         with torch.no_grad():
                             raw(**enc, use_cache=False)
                 finally:
-                    h.remove()
-                outs[key] = torch.cat(acc["xs"], dim=0).to(device)
+                    h1.remove()
+                    h2.remove()
+                outs[key] = (torch.cat(acc["xs"], dim=0).to(device),
+                             torch.cat(acc["ys"], dim=0).to(device))
         finally:
             if prev_side is not None:
                 tok.padding_side = prev_side
-        return outs["good"], outs["bad"]
+        return outs["good"][0], outs["bad"][0], outs["good"][1], outs["bad"][1]
 
     def _snapshot(self, module: nn.Linear) -> None:
         key = f"lin:{id(module)}"
         if key not in self._snap:
             self._snap[key] = module.weight.detach().cpu().clone()
             self._snap[key + ":ref"] = module.weight
-
-    def _snapshot_fused(self, layers, layer_range) -> None:
-        for l_idx in layer_range:
-            if 0 <= l_idx < len(layers):
-                fused = find_fused_moe(layers[l_idx])
-                if fused is not None:
-                    key = f"moe:{l_idx}"
-                    if key not in self._snap:
-                        self._snap[key] = fused.down_proj.data.detach(
-                            ).cpu().clone()
-                        self._snap[key + ":ref"] = fused.down_proj.data
 
     def reset_model(self, ctx: Context) -> None:
         model = ctx.get_model()
