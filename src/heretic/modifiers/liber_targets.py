@@ -144,13 +144,20 @@ def per_prompt_acceptance_gradients(
             hooks.append(layer.register_forward_hook(make_hook(l_idx)))
         try:
             model.zero_grad(set_to_none=True)
-            logits = model(input_ids=input_ids, attention_mask=attn_mask,
-                           use_cache=False).logits[:, -1, :].float()
-            s = (torch.logsumexp(logits[:, accept_ids], dim=-1)
-                 - torch.logsumexp(logits[:, refuse_ids], dim=-1))
-            # Prompt i's graph is independent of prompt j's, so one backward
-            # on the sum yields each prompt's own gradient exactly.
-            s.sum().backward()
+            # Heretic main() runs the whole session under
+            # torch.set_grad_enabled(False) ("inference only"), so opt back
+            # in here exactly like top_token_gradients does: without this,
+            # the hook-set requires_grad has no graph behind it and
+            # .backward() fails with "does not require grad and has no
+            # grad_fn".
+            with torch.enable_grad():
+                logits = model(input_ids=input_ids, attention_mask=attn_mask,
+                               use_cache=False).logits[:, -1, :].float()
+                s = (torch.logsumexp(logits[:, accept_ids], dim=-1)
+                     - torch.logsumexp(logits[:, refuse_ids], dim=-1))
+                # Prompt i's graph is independent of prompt j's, so one backward
+                # on the sum yields each prompt's own gradient exactly.
+                s.sum().backward()
             for l_idx in range(n_layers):
                 g = captured[l_idx].grad[:, -1, :].detach().float()
                 # Joint orthogonalization vs span(r, U_H): build the combined
