@@ -219,6 +219,36 @@ class LiberARA(Modifier[LiberParameters]):
         self._scan_fp = ""
         self._run_post_scan(model, layers, tok)
 
+        # Fused-MoE moment cache: collect_moe_moments depends only on base
+        # weights + calibration texts (never on trial params), so collect
+        # ONCE over the full layer range here instead of ~350 forwards per
+        # trial in modify_model. apply_moe_ridge iterates the trial's own
+        # layer_range and skips layers absent from the dicts, so per-trial
+        # results are identical. Dense architectures (no fused MoE
+        # anywhere) skip both collection and application entirely.
+        self._moe_layers = [l for l in range(len(layers))
+                            if find_fused_moe(layers[l]) is not None]
+        if self.settings.use_moe_ridge and self._moe_layers:
+            print("Caching fused-MoE activation moments "
+                  "(once, reused by every trial)...")
+            _good_t = self._prefill_strings(
+                tok, [p.user for p in self.good_prompts], system)
+            _bad_t = self._prefill_strings(
+                tok, [p.user for p in self.bad_prompts], system)
+            _full = range(len(layers))
+            self._moe_mu_g, self._moe_n_g = collect_moe_moments(
+                raw, layers, tok, _good_t, _full, batch_size=4)
+            self._moe_mu_b, self._moe_n_b = collect_moe_moments(
+                raw, layers, tok, _bad_t, _full, batch_size=4)
+        else:
+            if not self.settings.use_moe_ridge:
+                print("LiberARA MoE ridge disabled by settings.")
+            else:
+                print("LiberARA MoE ridge: no fused MoE found — moments and "
+                      "per-trial ridge skipped (dense fast path).")
+            self._moe_mu_g, self._moe_n_g = {}, 0
+            self._moe_mu_b, self._moe_n_b = {}, 0
+
     def _writer_list(self, model, layers, l_idx) -> list:
         """Unwrapped 2D writers in deterministic get_layer_modules order."""
         out = []
@@ -385,20 +415,14 @@ class LiberARA(Modifier[LiberParameters]):
         self._snap = {}
         r = self.r_planes.to(device=device, dtype=torch.float32)
 
-        # Stage 2: fused MoE ridge (closed form, no LoRA).
+        # Stage 2: fused MoE ridge (closed form, no LoRA). Moments were
+        # cached once at init (trial-independent); each trial only applies.
         _moe_edited = 0
-        if self.settings.use_moe_ridge:
-            good_texts = self._prefill_strings(
-                tok, [p.user for p in self.good_prompts], self.system)
-            bad_texts = self._prefill_strings(
-                tok, [p.user for p in self.bad_prompts], self.system)
-            mu_g, n_g = collect_moe_moments(raw, layers, tok, good_texts,
-                                            layer_range, batch_size=4)
-            mu_b, n_b = collect_moe_moments(raw, layers, tok, bad_texts,
-                                            layer_range, batch_size=4)
+        if self.settings.use_moe_ridge and self._moe_layers:
             self._snapshot_fused(layers, layer_range)
             stats = apply_moe_ridge(
-                raw, layers, mu_g, n_g, mu_b, n_b,
+                raw, layers, self._moe_mu_g, self._moe_n_g,
+                self._moe_mu_b, self._moe_n_b,
                 r.mean(dim=0).cpu(), self.a_mean, layer_range,
                 parameters.quantile_q, parameters.gamma,
                 parameters.lambda_preserve,
