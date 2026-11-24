@@ -107,12 +107,19 @@ def collect_moe_moments(
                         continue
                     xe = x_cpu[rows].to(dev)
                     with torch.no_grad():
-                        gu = F.linear(xe, exp_mod.gate_up_proj[e])
+                        # gate_up_proj may be bf16/fp16 (dtype auto); match
+                        # activation dtype or F.linear raises (and the bare
+                        # except below would silently zero the moments).
+                        gu = F.linear(xe, exp_mod.gate_up_proj[e].to(xe.dtype))
                     gate, up = gu.split(inter, dim=-1)
                     act = (F.silu(gate) * up).float().cpu()
                     ge = w_cpu[rows, slots].unsqueeze(-1)
                     acc[l_idx][e] += ((ge * act) ** 2).sum(dim=0)
-            except Exception:
+            except (KeyError, IndexError, ValueError):
+                # Unknown dispatcher shapes: skip this batch for this layer.
+                # Deliberately NOT bare `except`: a dtype/device RuntimeError
+                # here once silently zeroed every moment (bf16 weights vs
+                # float32 activations). Real failures must surface.
                 return
         return _pre
 

@@ -410,7 +410,7 @@ def apply_s_ridge(
     score = mb.sqrt() * snorm
     k = max(1, min(W.shape[1] - 1, int(round(top_fraction * W.shape[1]))))
     order = score.argsort(descending=True)
-    mask = torch.zeros(W.shape[1], dtype=torch.bool)
+    mask = torch.zeros(W.shape[1], dtype=torch.bool, device=W.device)
     mask[order[:k]] = True
     norms = W.norm(dim=0, keepdim=True).clamp_min(1e-8)
     beta = rho * snorm

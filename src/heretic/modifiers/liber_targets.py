@@ -153,17 +153,30 @@ def per_prompt_acceptance_gradients(
             s.sum().backward()
             for l_idx in range(n_layers):
                 g = captured[l_idx].grad[:, -1, :].detach().float()
-                # Orthogonalize against r (skipped for the harmlessness
-                # basis, which must span the raw KL-sensitive subspace).
+                # Joint orthogonalization vs span(r, U_H): build the combined
+                # basis and project once. Sequential (r then U) reintroduces
+                # r whenever U_H contains an r-component (it does: U_H is
+                # built from raw top-1 grads, deliberately NOT pre-orth vs r).
+                # QR makes the result exactly ⊥ both (Theorem 5: P_{r,U_H}).
                 if orth_r:
                     if r_planes is not None and (l_idx + 1) < r_planes.shape[0]:
-                        rc = r_planes[l_idx + 1].reshape(-1, 1)
+                        rc = r_planes[l_idx + 1].to(dtype=torch.float32)
                     elif r_planes is not None:
-                        rc = r_planes.mean(dim=0).reshape(-1, 1)
+                        rc = r_planes.mean(dim=0).to(dtype=torch.float32)
                     else:
-                        rc = r_col
-                    g = g - (g @ rc) * rc.T
-                if harmless_bases and l_idx in harmless_bases \
+                        rc = r_col.reshape(-1).to(dtype=torch.float32)
+                    Uh = None
+                    if harmless_bases and l_idx in harmless_bases \
+                            and harmless_bases[l_idx] is not None:
+                        Uh = harmless_bases[l_idx].to(
+                            device=device, dtype=torch.float32)  # (D, K)
+                    if Uh is not None:
+                        C = torch.cat([rc.reshape(-1, 1), Uh], dim=1)
+                        Q, _ = torch.linalg.qr(C)
+                        g = g - (g @ Q) @ Q.T
+                    else:
+                        g = g - (g @ rc.reshape(-1, 1)) * rc.reshape(1, -1)
+                elif harmless_bases and l_idx in harmless_bases \
                         and harmless_bases[l_idx] is not None:
                     g = project_out_subspace(
                         g, harmless_bases[l_idx].to(device=device,
