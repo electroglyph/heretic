@@ -1,0 +1,33 @@
+{
+ "75f73268db48e72c": {
+  "date": "2026-11-24T04:47:54Z",
+  "layers": {
+   "0": {
+    "0": {
+     "has_bias": false,
+     "kind": "suspect",
+     "taps": []
+    },
+    "1": {
+     "has_bias": false,
+     "kind": "clean",
+     "taps": []
+    }
+   },
+   "1": {
+    "0": {
+     "has_bias": false,
+     "kind": "suspect",
+     "taps": []
+    },
+    "1": {
+     "has_bias": false,
+     "kind": "clean",
+     "taps": []
+    }
+   }
+  },
+  "probes": {},
+  "verdict": "clean"
+ }
+}
